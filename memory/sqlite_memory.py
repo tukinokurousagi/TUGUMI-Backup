@@ -1,0 +1,864 @@
+# -*- coding: utf-8 -*-
+"""
+TUGUMIv6 SQLite Memory Core
+- SQLite WAL (Write-Ahead Logging) Mode
+- PRAGMA busy_timeout = 60000 (Deadlock-Free in Termux)
+- BEGIN IMMEDIATE 書き込みトランザクション (読取→書込ロック昇格競合 "database is locked" の根絶)
+- with 脱出時に commit/rollback + close を保証 (中断/例外時の接続・ロック残留ゼロ)
+- Multithread-Safe with threading.RLock
+- FTS5 Full-Text Search Integration
+"""
+
+import sqlite3
+import threading
+import json
+import math
+import re
+from datetime import datetime
+from typing import List, Dict, Any, Optional
+
+def compute_ebbinghaus_decay(
+    last_accessed_str: str,
+    access_count: int = 1,
+    importance: int = 3,
+    tier: str = "semantic",
+    half_life_days: float = 30.0
+) -> float:
+    """エビングハウス忘却曲線に基づく記憶強度（0.0〜1.0）を計算"""
+    if importance >= 5:
+        # コアプロファイル・最重要規約は永久不滅（減衰なし）
+        return 1.0
+
+    try:
+        # SQLite CURRENT_TIMESTAMP: "YYYY-MM-DD HH:MM:SS" または ISO8601
+        clean_str = str(last_accessed_str).replace("T", " ")
+        if "." in clean_str:
+            clean_str = clean_str.split(".")[0]
+        last_dt = datetime.strptime(clean_str[:19], "%Y-%m-%d %H:%M:%S")
+        elapsed_days = max(0.0, (datetime.now() - last_dt).total_seconds() / 86400.0)
+    except Exception:
+        elapsed_days = 0.0
+
+    tier_half_lives = {
+        "working": 1.0,     # 短期作業（1日で減衰）
+        "episodic": 14.0,   # エピソード（2週間）
+        "procedural": 60.0, # 手続き・ワークフロー（2ヶ月）
+        "semantic": 180.0   # 知識・事実（半年）
+    }
+    base_half_life = tier_half_lives.get(tier.lower(), half_life_days or 30.0)
+    stability = base_half_life * (1.0 + 0.5 * math.log(1.0 + max(0, access_count))) * (0.6 + 0.2 * max(1, min(5, importance)))
+    decay = math.exp(- elapsed_days / max(0.1, stability))
+    return round(float(decay), 4)
+
+class ManagedConnection(sqlite3.Connection):
+    """`with` 脱出時に commit（例外時は rollback）した上で必ず close する接続。
+
+    標準の sqlite3.Connection は __exit__ で commit/rollback するだけで close しないため、
+    タスク中断(CancelledError/GeneratorExit)や例外時に接続とトランザクションが残留し、
+    再開後の書き込みが "database is locked" で待たされる原因になる。
+    """
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        try:
+            return super().__exit__(exc_type, exc_val, exc_tb)
+        finally:
+            try:
+                self.close()
+            except Exception:
+                pass
+
+
+def open_wal_connection(db_path: str, row_factory: Any = None, busy_timeout_ms: int = 60000) -> sqlite3.Connection:
+    """WAL + busy_timeout 強制 + 書込は BEGIN IMMEDIATE で開始する共有接続ファクトリ。
+
+    isolation_level="IMMEDIATE" により INSERT/UPDATE/DELETE の直前に自動で BEGIN IMMEDIATE が発行され、
+    DEFERRED トランザクションの読取→書込ロック昇格競合（busy_timeout を無視して即 locked になる）を防ぐ。
+    """
+    conn = sqlite3.connect(
+        db_path,
+        timeout=busy_timeout_ms / 1000.0,
+        isolation_level="IMMEDIATE",
+        factory=ManagedConnection,
+    )
+    try:
+        if row_factory is not None:
+            conn.row_factory = row_factory
+        conn.execute(f"PRAGMA busy_timeout = {int(busy_timeout_ms)};")
+        conn.execute("PRAGMA journal_mode = WAL;")
+        conn.execute("PRAGMA synchronous = NORMAL;")
+    except Exception:
+        conn.close()
+        raise
+    return conn
+
+
+class SQLiteMemory:
+    """Thread-Safe WAL-Enabled SQLite Memory for TUGUMIv6"""
+    def __init__(self, db_path: str = "/data/data/com.termux/files/home/TUGUMIv6/data/tugumi_memory.db"):
+        self.db_path = db_path
+        self.lock = threading.RLock()
+        self._init_schema()
+
+    def _get_connection(self) -> sqlite3.Connection:
+        return open_wal_connection(self.db_path, row_factory=sqlite3.Row)
+
+    def _init_schema(self) -> None:
+        with self.lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                # 1. 会話・対話ログ
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS conversation_logs (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        session_id TEXT DEFAULT 'default',
+                        role TEXT NOT NULL,
+                        content TEXT NOT NULL,
+                        mode TEXT DEFAULT 'light',
+                        tokens_estimate INTEGER DEFAULT 0,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    );
+                """)
+                # 既存テーブルへのsession_idカラム追加（マイグレーション）
+                try:
+                    cursor.execute("ALTER TABLE conversation_logs ADD COLUMN session_id TEXT DEFAULT 'default';")
+                except Exception:
+                    pass
+                # 1.5 チャットセッション・スレッド管理
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS chat_sessions (
+                        id TEXT PRIMARY KEY,
+                        title TEXT NOT NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    );
+                """)
+                # デフォルトセッション確保
+                cursor.execute("""
+                    INSERT OR IGNORE INTO chat_sessions (id, title) VALUES ('default', 'メインチャット');
+                """)
+                # 2. キーバリュー設定
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS kv_store (
+                        key TEXT PRIMARY KEY,
+                        value TEXT NOT NULL,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    );
+                """)
+                # 3. ナレッジ・FTS5
+                cursor.execute("""
+                    CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_fts USING fts5(
+                        title,
+                        content,
+                        category,
+                        source_path
+                    );
+                """)
+                # 4. 長期・エピソード・構造化記憶（Cognitive Multi-Tier Memory）
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS structured_memories (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        tier TEXT DEFAULT 'semantic', -- 'working', 'episodic', 'semantic', 'procedural'
+                        category TEXT NOT NULL, -- 'preference', 'directive', 'master_profile', 'decision', 'termux_env', 'project'
+                        subject TEXT NOT NULL,
+                        fact_content TEXT NOT NULL,
+                        importance INTEGER DEFAULT 3, -- 1 (low) to 5 (critical)
+                        access_count INTEGER DEFAULT 0,
+                        last_accessed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        decay_score REAL DEFAULT 1.0,
+                        decay_half_life_days REAL DEFAULT 30.0,
+                        tags TEXT DEFAULT ''
+                    );
+                """)
+                # 既存テーブルへの4-Tier・減衰カラム追加マイグレーション
+                for col_name, col_type in [
+                    ("tier", "TEXT DEFAULT 'semantic'"),
+                    ("decay_score", "REAL DEFAULT 1.0"),
+                    ("decay_half_life_days", "REAL DEFAULT 30.0"),
+                    ("tags", "TEXT DEFAULT ''")
+                ]:
+                    try:
+                        cursor.execute(f"ALTER TABLE structured_memories ADD COLUMN {col_name} {col_type};")
+                    except Exception:
+                        pass
+
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_memories_cat_imp 
+                    ON structured_memories (category, importance DESC);
+                """)
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_memories_tier_decay 
+                    ON structured_memories (tier, decay_score DESC);
+                """)
+                cursor.execute("""
+                    CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
+                        subject,
+                        fact_content,
+                        category,
+                        content=structured_memories,
+                        content_rowid=id
+                    );
+                """)
+                # FTS5 自動同期トリガー
+                cursor.execute("""
+                    CREATE TRIGGER IF NOT EXISTS trg_memories_ai AFTER INSERT ON structured_memories BEGIN
+                        INSERT INTO memory_fts(rowid, subject, fact_content, category) 
+                        VALUES (new.id, new.subject, new.fact_content, new.category);
+                    END;
+                """)
+                cursor.execute("""
+                    CREATE TRIGGER IF NOT EXISTS trg_memories_ad AFTER DELETE ON structured_memories BEGIN
+                        INSERT INTO memory_fts(memory_fts, rowid, subject, fact_content, category) 
+                        VALUES ('delete', old.id, old.subject, old.fact_content, old.category);
+                    END;
+                """)
+                cursor.execute("""
+                    CREATE TRIGGER IF NOT EXISTS trg_memories_au AFTER UPDATE ON structured_memories BEGIN
+                        INSERT INTO memory_fts(memory_fts, rowid, subject, fact_content, category) 
+                        VALUES ('delete', old.id, old.subject, old.fact_content, old.category);
+                        INSERT INTO memory_fts(rowid, subject, fact_content, category) 
+                        VALUES (new.id, new.subject, new.fact_content, new.category);
+                    END;
+                """)
+                conn.commit()
+
+    def create_session(self, session_id: Optional[str] = None, title: str = "新しい会話") -> str:
+        """新規チャットセッション（スレッド）を作成"""
+        import uuid
+        sid = session_id or f"sess_{uuid.uuid4().hex[:8]}"
+        with self.lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    INSERT OR REPLACE INTO chat_sessions (id, title, updated_at)
+                    VALUES (?, ?, CURRENT_TIMESTAMP)
+                """, (sid, title))
+                conn.commit()
+                return sid
+
+    def get_sessions(self) -> List[Dict[str, Any]]:
+        """全チャットセッション（スレッド）を最新更新順に取得（テスト用一時セッションは除外）"""
+        with self.lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT id, title, created_at, updated_at
+                    FROM chat_sessions
+                    WHERE id NOT LIKE 'test_%' AND id NOT LIKE 'pytest_%'
+                    ORDER BY updated_at DESC
+                """)
+                rows = cursor.fetchall()
+                if not rows:
+                    # 空ならdefaultセッションを作成して返す
+                    self.create_session("default", "メインチャット")
+                    return [{"id": "default", "title": "メインチャット"}]
+                return [dict(r) for r in rows]
+
+    def get_session_messages(self, session_id: str = "default", limit: int = 50) -> List[Dict[str, Any]]:
+        """指定セッション内の対話メッセージを古い順で取得"""
+        with self.lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT role, content, mode, session_id, created_at
+                    FROM conversation_logs
+                    WHERE session_id = ?
+                    ORDER BY id DESC LIMIT ?
+                """, (session_id, limit))
+                rows = cursor.fetchall()
+                return [dict(r) for r in reversed(rows)]
+
+    def delete_session(self, session_id: str) -> int:
+        """指定セッションの全メッセージおよびセッションレコードを物理削除"""
+        with self.lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM conversation_logs WHERE session_id = ?;", (session_id,))
+                deleted = cursor.rowcount
+                cursor.execute("DELETE FROM chat_sessions WHERE id = ?;", (session_id,))
+                conn.commit()
+
+                # 全スレッド消去時またはdefault消去時は、空のdefaultセッションを自動再生成して整合性を保護
+                cursor.execute("SELECT COUNT(*) FROM chat_sessions;")
+                cnt = cursor.fetchone()[0]
+                if cnt == 0 or session_id == "default":
+                    cursor.execute("INSERT OR IGNORE INTO chat_sessions (id, title) VALUES ('default', 'メインチャット');")
+                    conn.commit()
+
+                try:
+                    conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                except Exception:
+                    pass
+                return deleted
+
+    def add_message(self, role: str, content: str, mode: str = "light", session_id: str = "default") -> int:
+        with self.lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                # セッション確保
+                cursor.execute("INSERT OR IGNORE INTO chat_sessions (id, title) VALUES (?, '新しい会話');", (session_id,))
+                cursor.execute("""
+                    INSERT INTO conversation_logs (session_id, role, content, mode, tokens_estimate)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (session_id, role, content, mode, max(1, len(content) // 3)))
+                msg_id = cursor.lastrowid
+
+                # ユーザーの初回発言ならスレッドタイトルを発言先頭から自動生成
+                if role == "user":
+                    cursor.execute("SELECT COUNT(*) as cnt FROM conversation_logs WHERE session_id = ? AND role = 'user'", (session_id,))
+                    u_cnt = cursor.fetchone()["cnt"]
+                    if u_cnt <= 1:
+                        auto_title = content.strip().split("\n")[0][:24]
+                        if len(content.strip()) > 24:
+                            auto_title += "..."
+                        cursor.execute("UPDATE chat_sessions SET title = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (auto_title, session_id))
+                    else:
+                        cursor.execute("UPDATE chat_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?", (session_id,))
+
+                conn.commit()
+                return msg_id
+
+    def get_recent_messages(self, limit: int = 15, session_id: Optional[str] = "default") -> List[Dict[str, Any]]:
+        with self.lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                if session_id and session_id != "*":
+                    cursor.execute("""
+                        SELECT role, content, mode, session_id, created_at
+                        FROM conversation_logs
+                        WHERE session_id = ?
+                        ORDER BY id DESC LIMIT ?
+                    """, (session_id, limit))
+                else:
+                    cursor.execute("""
+                        SELECT role, content, mode, session_id, created_at
+                        FROM conversation_logs
+                        WHERE session_id NOT LIKE 'test_%' AND session_id NOT LIKE 'pytest_%'
+                        ORDER BY id DESC LIMIT ?
+                    """, (limit,))
+                rows = cursor.fetchall()
+                # 古い順に戻す
+                return [dict(r) for r in reversed(rows)]
+
+    def get_compressed_context(self, session_id: str = "default", limit: int = 40, max_turns: int = 24) -> str:
+        """ContextCompressor を用いて直近対話履歴をロスレス圧縮・整形して返す（/compact 等で使用）"""
+        messages = self.get_recent_messages(limit=limit, session_id=session_id)
+        if not messages:
+            return ""
+        try:
+            from persona.context_compressor import ContextCompressor
+            compressor = ContextCompressor()
+            pruned = compressor.prune_history(messages, max_turns=max_turns)
+            lines = []
+            for entry in pruned:
+                role_label = "マスター拓磨様" if entry.get("role") == "user" else "つぐみ"
+                content = entry.get("content", "").strip()
+                if entry.get("role") == "user":
+                    masked = content
+                else:
+                    masked = compressor.mask_observation(content, tool_name=f"log_{entry.get('role')}")
+                lines.append(f"[{role_label}]: {masked}")
+            return "\n".join(lines)
+        except Exception:
+            return "\n".join(f"[{m.get('role')}]: {m.get('content', '')}" for m in messages[-max_turns:])
+
+    def clear_conversation_history(self) -> int:
+        """全会話履歴およびセッションを完全消去し、ディスクWALもトランケートする"""
+        with self.lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM conversation_logs;")
+                deleted = cursor.rowcount
+                cursor.execute("DELETE FROM chat_sessions;")
+                cursor.execute("INSERT INTO chat_sessions (id, title) VALUES ('default', 'メインチャット');")
+                try:
+                    cursor.execute("DELETE FROM sqlite_sequence WHERE name = 'conversation_logs';")
+                except Exception:
+                    pass
+                conn.commit()
+                try:
+                    conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                except Exception:
+                    pass
+                return deleted
+
+    def index_knowledge(self, title: str, content: str, category: str = "doc", source_path: str = "") -> None:
+        with self.lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    INSERT INTO knowledge_fts (title, content, category, source_path)
+                    VALUES (?, ?, ?, ?)
+                """, (title, content, category, source_path))
+                conn.commit()
+
+    @staticmethod
+    def _extract_query_keywords(query: str) -> List[str]:
+        """自然言語文からFTS5/LIKE検索用の意味のあるキーワード群を抽出"""
+        if not query or not query.strip():
+            return []
+        q_clean = query.strip()
+        stopwords = {
+            "これ", "それ", "あれ", "ここ", "そこ", "こと", "もの", "ため", "よう",
+            "さん", "です", "ます", "する", "した", "して", "いる", "ある", "なる",
+            "できる", "お願い", "教えて", "について", "なんか", "ずっと", "から", "まで",
+            "だろ", "でしょう", "ますか", "ですか", "どう", "なに", "いつ", "どこ",
+            "the", "and", "for", "with", "that", "this", "from", "what", "how", "why",
+        }
+        tokens: List[str] = []
+        # 1. 英数字・モデル名・技術トークン (例: Argon, Gemini, TUGUMIv6, FTS5, 3072d)
+        for m in re.findall(r"[A-Za-z0-9_.\-]+", q_clean):
+            t = m.strip(".-_")
+            if len(t) >= 2 and t.lower() not in stopwords:
+                tokens.append(t)
+        # 2. 漢字・カタカナの連続語 (2文字以上)
+        for m in re.findall(r"[一-龥々〆ヵヶ]{2,}|[ァ-ヴー]{2,}", q_clean):
+            if m not in stopwords:
+                tokens.append(m)
+        # 3. 短いクエリそのものも候補として保持
+        if len(q_clean) <= 24 and q_clean not in tokens:
+            tokens.insert(0, q_clean)
+        # 重複排除（順序維持）
+        seen = set()
+        unique_tokens = []
+        for t in tokens:
+            tl = t.lower()
+            if tl not in seen:
+                seen.add(tl)
+                unique_tokens.append(t)
+        return unique_tokens[:12]
+
+    def search_knowledge_fts(self, query: str, limit: int = 5) -> List[Dict[str, Any]]:
+        keywords = self._extract_query_keywords(query)
+        with self.lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                rows = []
+                try:
+                    fts_terms = [re.sub(r'["\'()*?^:;+\-/\\]', "", kw).strip() for kw in keywords]
+                    fts_terms = [ f'"{t}"' for t in fts_terms if len(t) >= 2 ]
+                    fts_query = " OR ".join(fts_terms) if fts_terms else query
+                    cursor.execute("""
+                        SELECT title, content, category, source_path, rank
+                        FROM knowledge_fts
+                        WHERE knowledge_fts MATCH ?
+                        ORDER BY rank LIMIT ?
+                    """, (fts_query, limit))
+                    rows = cursor.fetchall()
+                except Exception:
+                    rows = []
+
+                if not rows:
+                    search_terms = keywords if keywords else [query.strip()]
+                    scored: Dict[int, Dict[str, Any]] = {}
+                    for kw in search_terms[:8]:
+                        if not kw:
+                            continue
+                        pat = f"%{kw}%"
+                        cursor.execute("""
+                            SELECT rowid, title, content, category, source_path
+                            FROM knowledge_fts
+                            WHERE title LIKE ? OR content LIKE ?
+                            LIMIT ?
+                        """, (pat, pat, limit * 3))
+                        for r in cursor.fetchall():
+                            rid = r["rowid"]
+                            if rid not in scored:
+                                d = dict(r)
+                                d.pop("rowid", None)
+                                d["rank"] = -1.0
+                                scored[rid] = d
+                            else:
+                                scored[rid]["rank"] -= 1.0
+                    sorted_items = sorted(scored.values(), key=lambda x: x["rank"])
+                    return sorted_items[:limit]
+                return [dict(r) for r in rows]
+
+    # ==================== Key-Value 設定ストア ====================
+    def set_kv(self, key: str, value: Any) -> None:
+        """KV設定を永続化（JSONシリアライズ）"""
+        val_str = json.dumps(value, ensure_ascii=False) if not isinstance(value, str) else value
+        with self.lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    INSERT INTO kv_store (key, value, updated_at)
+                    VALUES (?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=CURRENT_TIMESTAMP
+                """, (key, val_str))
+                conn.commit()
+
+    def get_kv(self, key: str, default: Any = None) -> Any:
+        """KV設定を取得"""
+        with self.lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT value FROM kv_store WHERE key = ?", (key,))
+                row = cursor.fetchone()
+                if not row:
+                    return default
+                val_str = row[0]
+                try:
+                    return json.loads(val_str)
+                except Exception:
+                    return val_str
+
+    def delete_kv(self, key: str) -> bool:
+        with self.lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM kv_store WHERE key = ?", (key,))
+                conn.commit()
+                return cursor.rowcount > 0
+
+    def list_kv(self) -> Dict[str, Any]:
+        with self.lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT key, value FROM kv_store ORDER BY key")
+                result = {}
+                for row in cursor.fetchall():
+                    try:
+                        result[row[0]] = json.loads(row[1])
+                    except Exception:
+                        result[row[0]] = row[1]
+                return result
+
+    # ==================== 構造化・長期・エピソード記憶 (4-Tier & Decay) ====================
+    def add_memory(self, category: str, subject: str, fact_content: str, importance: int = 3, tier: str = "semantic", tags: str = "") -> int:
+        """重要な事実・拓磨様の好み・決定事項・環境知識を4-Tier長期記憶に追加"""
+        importance = max(1, min(5, importance))
+        tier = tier if tier in ("working", "episodic", "semantic", "procedural") else "semantic"
+        with self.lock:
+            with self._get_connection() as conn:
+                conn.execute("BEGIN IMMEDIATE")  # SELECT→INSERT/UPDATE の競合を原子化
+                cursor = conn.cursor()
+                # 既存の同一subject+categoryがあれば更新、なければ挿入
+                cursor.execute("""
+                    SELECT id FROM structured_memories
+                    WHERE category = ? AND subject = ?
+                """, (category, subject))
+                existing = cursor.fetchone()
+                if existing:
+                    mem_id = existing[0]
+                    cursor.execute("""
+                        UPDATE structured_memories
+                        SET fact_content = ?, importance = ?, tier = ?, tags = ?,
+                            access_count = access_count + 1, last_accessed_at = CURRENT_TIMESTAMP, decay_score = 1.0
+                        WHERE id = ?
+                    """, (fact_content, importance, tier, tags, mem_id))
+                    conn.commit()
+                    return mem_id
+                else:
+                    cursor.execute("""
+                        INSERT INTO structured_memories (category, subject, fact_content, importance, tier, tags, decay_score)
+                        VALUES (?, ?, ?, ?, ?, ?, 1.0)
+                    """, (category, subject, fact_content, importance, tier, tags))
+                    conn.commit()
+                    return cursor.lastrowid
+
+    def remember(self, content: str, category: str = "fact", tier: str = "semantic", subject: Optional[str] = None, importance: int = 3, tags: Optional[List[str]] = None) -> int:
+        """内容テキストから自動要約Subjectを生成し記憶を永続定着（MCP/エージェント標準）"""
+        tag_str = ",".join(tags) if isinstance(tags, list) else (tags or "")
+        if not subject:
+            first_line = content.strip().split("\n")[0]
+            clean_subject = re.sub(r"^[#\-\*\s]+", "", first_line)[:25].strip()
+            subject = clean_subject or f"{category}_{tier}"
+        return self.add_memory(
+            category=category,
+            subject=subject,
+            fact_content=content,
+            importance=importance,
+            tier=tier,
+            tags=tag_str
+        )
+
+    def get_memories(self, category: Optional[str] = None, tier: Optional[str] = None, limit: int = 15, min_importance: int = 1) -> List[Dict[str, Any]]:
+        """カテゴリ・Tier・重要度順で記憶を取得"""
+        with self.lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                conditions = ["importance >= ?"]
+                params: List[Any] = [min_importance]
+
+                if category:
+                    conditions.append("category = ?")
+                    params.append(category)
+                if tier:
+                    conditions.append("tier = ?")
+                    params.append(tier)
+
+                where_clause = " AND ".join(conditions)
+                params.append(limit)
+
+                cursor.execute(f"""
+                    SELECT id, category, subject, fact_content, importance, access_count, created_at, last_accessed_at,
+                           tier, decay_score, decay_half_life_days, tags
+                    FROM structured_memories
+                    WHERE {where_clause}
+                    ORDER BY importance DESC, last_accessed_at DESC LIMIT ?
+                """, tuple(params))
+                rows = cursor.fetchall()
+                return [dict(r) for r in rows]
+
+    def get_tier_stats(self) -> Dict[str, Any]:
+        """4-Tier別の件数、平均減衰スコア、統計サマリーを返却"""
+        with self.lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT tier, COUNT(*) as cnt, AVG(decay_score) as avg_decay, SUM(access_count) as total_acc
+                    FROM structured_memories
+                    GROUP BY tier
+                """)
+                rows = cursor.fetchall()
+                tier_stats: Dict[str, Any] = {}
+                for r in rows:
+                    t_name = r["tier"] or "semantic"
+                    tier_stats[t_name] = {
+                        "count": r["cnt"],
+                        "avg_decay": round(r["avg_decay"] or 1.0, 3),
+                        "total_access": r["total_acc"] or 0
+                    }
+                cursor.execute("SELECT COUNT(*), AVG(decay_score), SUM(access_count) FROM structured_memories")
+                total_row = cursor.fetchone()
+                return {
+                    "total_count": total_row[0] or 0,
+                    "overall_avg_decay": round(total_row[1] or 1.0, 3),
+                    "total_access_count": total_row[2] or 0,
+                    "tiers": tier_stats
+                }
+
+    def search_memories(self, query: str, limit: int = 5) -> List[Dict[str, Any]]:
+        """FTS5およびキーワード分割LIKEスコアリングを用いた高精度ハイブリッド記憶検索"""
+        if not query or not query.strip():
+            return self.get_memories(limit=limit)
+
+        keywords = self._extract_query_keywords(query)
+        with self.lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                merged_by_id: Dict[int, Dict[str, Any]] = {}
+
+                # 1. FTS5 全文検索（キーワードOR検索 + 原文クエリ）
+                fts_candidates = []
+                fts_terms = [re.sub(r'["\'()*?^:;+\-/\\]', "", kw).strip() for kw in keywords]
+                fts_terms = [f'"{t}"' for t in fts_terms if len(t) >= 2]
+                if fts_terms:
+                    fts_candidates.append(" OR ".join(fts_terms))
+                fts_candidates.append(query.strip())
+
+                for fts_q in fts_candidates:
+                    try:
+                        cursor.execute("""
+                            SELECT m.id, m.category, m.subject, m.fact_content, m.importance, m.created_at,
+                                   m.tier, m.access_count, m.last_accessed_at, m.decay_score, m.decay_half_life_days, m.tags, f.rank
+                            FROM memory_fts f
+                            JOIN structured_memories m ON m.id = f.rowid
+                            WHERE memory_fts MATCH ?
+                            ORDER BY f.rank LIMIT ?
+                        """, (fts_q, max(limit * 2, 10)))
+                        for r in cursor.fetchall():
+                            d = dict(r)
+                            mid = d["id"]
+                            if mid not in merged_by_id:
+                                d["_kw_hits"] = 2
+                                merged_by_id[mid] = d
+                        if merged_by_id:
+                            break
+                    except Exception:
+                        pass
+
+                # 2. 日本語自然文・複合語向けに抽出キーワードごとの部分一致スコアリングを常時併用
+                search_terms = keywords if keywords else [query.strip()]
+                for kw in search_terms[:10]:
+                    if not kw:
+                        continue
+                    pat = f"%{kw}%"
+                    cursor.execute("""
+                        SELECT id, category, subject, fact_content, importance, created_at,
+                               tier, access_count, last_accessed_at, decay_score, decay_half_life_days, tags, 0.0 as rank
+                        FROM structured_memories
+                        WHERE subject LIKE ? OR fact_content LIKE ? OR tags LIKE ? OR category LIKE ?
+                        ORDER BY importance DESC, last_accessed_at DESC LIMIT ?
+                    """, (pat, pat, pat, pat, max(limit * 3, 15)))
+                    for r in cursor.fetchall():
+                        d = dict(r)
+                        mid = d["id"]
+                        # subject一致は重み2、本文一致は重み1
+                        hit_weight = 2 if kw.lower() in (d.get("subject") or "").lower() else 1
+                        if mid not in merged_by_id:
+                            d["_kw_hits"] = hit_weight
+                            merged_by_id[mid] = d
+                        else:
+                            merged_by_id[mid]["_kw_hits"] = merged_by_id[mid].get("_kw_hits", 0) + hit_weight
+
+                results = list(merged_by_id.values())
+                results.sort(
+                    key=lambda x: (
+                        x.get("_kw_hits", 0),
+                        x.get("importance", 3),
+                        x.get("decay_score", 1.0),
+                        x.get("last_accessed_at") or "",
+                    ),
+                    reverse=True,
+                )
+                for item in results:
+                    item.pop("_kw_hits", None)
+                return results[:limit]
+
+    def recall_similar(self, query: str, limit: int = 5, tier: Optional[str] = None, min_decay: float = 0.01) -> List[Dict[str, Any]]:
+        """4-Tier & エビングハウス忘却曲線対応のハイブリッド想起（MCP/エージェント標準）"""
+        candidates = self.search_memories(query=query, limit=max(limit * 3, 15))
+        if not candidates:
+            candidates = self.get_memories(limit=max(limit * 2, 10))
+
+        scored_records = []
+        for r in candidates:
+            rec = dict(r)
+            r_tier = rec.get("tier", "semantic") or "semantic"
+            if tier and r_tier != tier:
+                continue
+
+            last_acc = rec.get("last_accessed_at", rec.get("created_at", ""))
+            acc_cnt = rec.get("access_count", 0)
+            imp = rec.get("importance", 3)
+            h_life = rec.get("decay_half_life_days", 30.0)
+
+            cur_decay = compute_ebbinghaus_decay(
+                last_accessed_str=last_acc,
+                access_count=acc_cnt,
+                importance=imp,
+                tier=r_tier,
+                half_life_days=h_life
+            )
+            rec["decay_score"] = cur_decay
+            if cur_decay < min_decay and imp < 5:
+                continue
+
+            rank_val = rec.get("rank")
+            rank_score = 1.0 / (1.0 + abs(float(rank_val))) if rank_val is not None else 0.5
+            hybrid_score = (rank_score * 0.4) + (cur_decay * 0.4) + ((imp / 5.0) * 0.2)
+            rec["hybrid_score"] = round(hybrid_score, 4)
+            scored_records.append(rec)
+
+        scored_records.sort(key=lambda x: x.get("hybrid_score", 0.0), reverse=True)
+        top_results = scored_records[:limit]
+
+        # 想起された記憶をtouch（アクセス強化・定着）
+        for item in top_results:
+            if "id" in item:
+                self.touch_memory(item["id"])
+            item.setdefault("key", item.get("subject", ""))
+            item.setdefault("value", item.get("fact_content", ""))
+
+        return top_results
+
+    def recall(self, query: str, limit: int = 5, tier: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Alias for recall_similar with backward-compatible key/value fields."""
+        return self.recall_similar(query=query, limit=limit, tier=tier)
+
+    def decay_all_memories(self) -> int:
+        """全記憶のエビングハウス減衰スコアを一括再計算して更新"""
+        with self.lock:
+            with self._get_connection() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                cursor = conn.cursor()
+                cursor.execute("SELECT id, last_accessed_at, access_count, importance, tier, decay_half_life_days FROM structured_memories")
+                rows = cursor.fetchall()
+                updated_count = 0
+                for row in rows:
+                    decay = compute_ebbinghaus_decay(
+                        last_accessed_str=row["last_accessed_at"],
+                        access_count=row["access_count"],
+                        importance=row["importance"],
+                        tier=row["tier"] or "semantic",
+                        half_life_days=row["decay_half_life_days"] or 30.0
+                    )
+                    cursor.execute("UPDATE structured_memories SET decay_score = ? WHERE id = ?", (decay, row["id"]))
+                    updated_count += 1
+                conn.commit()
+                return updated_count
+
+    def touch_memory(self, memory_id: int) -> None:
+        """記憶の参照カウンタとタイムスタンプを更新し、減衰スコアを1.0に再ブースト"""
+        with self.lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    UPDATE structured_memories
+                    SET access_count = access_count + 1, last_accessed_at = CURRENT_TIMESTAMP, decay_score = 1.0
+                    WHERE id = ?
+                """, (memory_id,))
+                conn.commit()
+
+    def delete_memory(self, memory_id: int) -> bool:
+        """記憶をID指定で削除"""
+        with self.lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM structured_memories WHERE id = ?", (memory_id,))
+                conn.commit()
+                return cursor.rowcount > 0
+
+    def delete_knowledge(self, doc_id: int) -> bool:
+        """FTS5ナレッジ知識をrowid指定で削除"""
+        with self.lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM knowledge_fts WHERE rowid = ?", (doc_id,))
+                conn.commit()
+                return cursor.rowcount > 0
+
+    def format_memory_context(self, query: str = "", max_chars: int = 4000) -> str:
+        """プロンプトに注入する高密度な記憶コンテキストを生成"""
+        lines = []
+        seen_ids = set()
+
+        # 1. 最重要コアディレクティブ・拓磨様プロファイル・システム自己認識 (importance >= 4)
+        core_memories = self.get_memories(min_importance=4, limit=20)
+        if core_memories:
+            lines.append("【拓磨様の重要設定・絶対方針・コア記憶】")
+            for m in core_memories:
+                seen_ids.add(m["id"])
+                lines.append(f"- [{m['category']}] {m['subject']}: {m['fact_content']}")
+
+        # 2. クエリに関連する記憶検索 (ハイブリッドキーワード＋FTS5＋減衰想起)
+        if query:
+            search_results = self.search_memories(query, limit=8)
+            relevant = [m for m in search_results if m["id"] not in seen_ids]
+            if relevant:
+                lines.append("【関連する過去記憶・コンテキスト】")
+                for m in relevant:
+                    seen_ids.add(m["id"])
+                    lines.append(f"- ({m['category']}) {m['subject']}: {m['fact_content']}")
+
+        # 3. 直近学習・定着した重要記憶 (importance >= 3) の補完注入
+        recent_learned = [m for m in self.get_memories(min_importance=3, limit=12) if m["id"] not in seen_ids]
+        if recent_learned:
+            lines.append("【直近の学習・定着ファクト】")
+            for m in recent_learned[:6]:
+                seen_ids.add(m["id"])
+                lines.append(f"- ({m['category']}) {m['subject']}: {m['fact_content']}")
+
+        full_text = "\n".join(lines)
+        if len(full_text) > max_chars:
+            full_text = full_text[:max_chars] + "\n...(一部記憶省略)"
+        return full_text
+
+    # ==================== データベース保守・健全化 ====================
+    def optimize_db(self) -> Dict[str, Any]:
+        """WALチェックポイント、インデックス最適化、整合性検証を実行"""
+        with self.lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("PRAGMA integrity_check;")
+                integrity = cursor.fetchone()[0]
+                cursor.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                chk = cursor.fetchall()
+                cursor.execute("PRAGMA optimize;")
+                return {
+                    "status": "optimized",
+                    "integrity": integrity,
+                    "wal_checkpoint": [tuple(r) for r in chk] if chk else "ok",
+                    "db_path": self.db_path
+                }

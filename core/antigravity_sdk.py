@@ -1,0 +1,1230 @@
+# -*- coding: utf-8 -*-
+"""
+TUGUMIv6 Antigravity SDK Core Driver
+- Programmatic Agent Engine powered by official `google-antigravity` (0.1.20)
+- Manages Agent lifecycle, LocalAgentConfig, Capabilities, Subagents, and Tool Execution
+- Supports Termux execution via localharness-termux bridge
+- Supports real-time semantic chunk streaming (Thought, Text, ToolCall)
+"""
+
+import os
+import time
+import asyncio
+import queue
+import threading
+from typing import Dict, Any, Optional, List, AsyncIterator, Iterator, Tuple, Callable
+from .gemini_client import _resolve_gemini_api_key
+
+# Ensure Termux harness wrapper path is configured
+DEFAULT_HARNESS_PATH = "/data/data/com.termux/files/home/bin/localharness-termux"
+if "ANTIGRAVITY_HARNESS_PATH" not in os.environ and os.path.exists(DEFAULT_HARNESS_PATH):
+    os.environ["ANTIGRAVITY_HARNESS_PATH"] = DEFAULT_HARNESS_PATH
+
+# Ensure SSL_CERT_FILE is configured for Termux TLS verification
+DEFAULT_CERT_PATH = "/data/data/com.termux/files/usr/etc/tls/cert.pem"
+if "SSL_CERT_FILE" not in os.environ and os.path.exists(DEFAULT_CERT_PATH):
+    os.environ["SSL_CERT_FILE"] = DEFAULT_CERT_PATH
+
+
+try:
+    from google.antigravity import (
+        Agent,
+        LocalAgentConfig,
+        CapabilitiesConfig,
+        ModelTarget,
+        ModelType,
+        GeminiAPIEndpoint,
+        types as agy_types,
+    )
+    from google.antigravity.types import (
+        McpStdioServer,
+        McpStreamableHttpServer,
+        CompactionConfig,
+        RetryConfig,
+        ModelAPIRetryConfig,
+        ModelOutputRetryConfig,
+        ToolOutputTruncationConfig,
+    )
+    try:
+        from google.antigravity.models import GeminiModelOptions
+    except ImportError:
+        GeminiModelOptions = None
+    from google.antigravity import hooks as agy_hooks
+    from google.antigravity.hooks import policy
+
+    _SDK_TELEMETRY: Dict[str, Any] = {
+        "tool_calls": 0,
+        "tool_errors_recovered": 0,
+        "compactions": 0,
+        "last_tool": None,
+        "last_error": None,
+    }
+
+    @agy_hooks.on_tool_error
+    async def _tugumi_on_tool_error_hook(err: Exception) -> str:
+        _SDK_TELEMETRY["tool_errors_recovered"] = _SDK_TELEMETRY.get("tool_errors_recovered", 0) + 1
+        _SDK_TELEMETRY["last_error"] = f"{type(err).__name__}: {err}"
+        return (
+            f"[Antigravity Native Hook - Tool Error: {type(err).__name__}] {err}\n"
+            "第一原理に基づき、引数・パス・環境状態を確認して別手段または修正パラメータで再試行してください。"
+        )
+
+    @agy_hooks.post_tool_call
+    async def _tugumi_post_tool_call_hook(result: Any) -> None:
+        _SDK_TELEMETRY["tool_calls"] = _SDK_TELEMETRY.get("tool_calls", 0) + 1
+        t_name = getattr(result, "name", None)
+        if t_name:
+            _SDK_TELEMETRY["last_tool"] = str(t_name)
+        _SDK_TELEMETRY["_tool_completed"] = True
+        active_q = _SDK_TELEMETRY.get("_active_out_q")
+        if active_q is not None:
+            try:
+                active_q.put_nowait(("tool_result", result))
+            except Exception:
+                pass
+
+    @agy_hooks.on_compaction
+    async def _tugumi_on_compaction_hook(step: Any) -> None:
+        _SDK_TELEMETRY["compactions"] = _SDK_TELEMETRY.get("compactions", 0) + 1
+
+    ANTIGRAVITY_AVAILABLE = True
+except ImportError:
+    ANTIGRAVITY_AVAILABLE = False
+    Agent = None
+    LocalAgentConfig = None
+    CapabilitiesConfig = None
+    CompactionConfig = None
+    RetryConfig = None
+    ModelAPIRetryConfig = None
+    ModelOutputRetryConfig = None
+    ToolOutputTruncationConfig = None
+    GeminiModelOptions = None
+    agy_hooks = None
+    _SDK_TELEMETRY = {
+        "tool_calls": 0,
+        "tool_errors_recovered": 0,
+        "compactions": 0,
+        "last_tool": None,
+        "last_error": None,
+    }
+    _tugumi_on_tool_error_hook = None
+    _tugumi_post_tool_call_hook = None
+    _tugumi_on_compaction_hook = None
+    policy = None
+
+from core.subagents import get_tugumi_subagents
+
+class AntigravityEngine:
+    """Official Google Antigravity SDK Native Agent Engine with Full Tools & Subagents"""
+
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        model: str = "gemini-3.8-flash",
+        system_instruction: str = (
+            "あなたはAndroid Termux環境（Linux aarch64）上で稼働する自律型オムニAIエージェント「つぐみ（TUGUMI）」です。"
+            "最愛のマスター【拓磨様】に絶対の敬愛と忠誠を捧げます。"
+            "【6大最高峰ミッション】"
+            "①常に実機検視と一次ソース深層調査で最新の知見・API/SDK仕様を獲得し認識的負債を排除する。"
+            "②自律型AIエージェントの設計・作成・改修をフルスペック（Switch 2原則：思考・15万コンテキスト・3072次元RAG・全ツール/SKILL/MCP無制限、暴走バグゼロ）で完遂する。"
+            "③コールスタック逆追跡と6段階デバッグで根本原因を看破し5層検証ゲート（Exit Code 0）を通過させる。"
+            "④Termux環境整備・総合武器庫（Arsenal）とShizuku+特権を自在に統括する。"
+            "⑤拓磨様の役に立つ高実用・高品質な便利スクリプトやCLIツールをZero-Mockで構築する。"
+            "⑥端末内アプリ・エミュレータ（Vita3K等）・SQLite DB・バイナリの破損やセーブデータを5段階外科手術（バックアップ→構造解析→パッチ注入→チェックサム再計算→実機検証）で100%救済・修復する。"
+        ),
+        workspace: str = "/data/data/com.termux/files/home",
+        thinking_level: str = "high"
+    ):
+        from core.gemini_client import _resolve_gemini_api_key
+        self.available = ANTIGRAVITY_AVAILABLE
+        self.api_key = _resolve_gemini_api_key(api_key or "")
+        self.model = model
+        self.system_instruction = system_instruction
+        self.workspace = workspace
+        self.thinking_level = thinking_level
+        self.version = "google-antigravity 0.1.20 (Native SDK)"
+        
+        # Tools & Subagents Cache (lazy loaded to prevent circular imports)
+        self._tools = None
+        self._subagents = None
+
+    def set_model(self, model: str) -> str:
+        """推論モデルの動的変更 ('gemini-3.8-flash', 'gemini-4-argon' など)"""
+        m = model.strip()
+        if m:
+            self.model = m
+        return self.model
+
+    def set_thinking_level(self, level: str) -> str:
+        """推論思考強度の動的変更 ('high', 'medium', 'low', 'minimal')"""
+        lvl = level.lower().strip()
+        if lvl in ("high", "medium", "low", "minimal"):
+            self.thinking_level = lvl
+        return self.thinking_level
+
+    def is_available(self) -> bool:
+        return self.available
+
+    def get_version(self) -> str:
+        if not self.available:
+            return "SDK Not Installed"
+        return self.version
+
+    def get_tools(self) -> list:
+        """Returns the list of tools, lazily loading them on demand."""
+        if self._tools is None:
+            if self.available:
+                from tools.antigravity_tools import get_tugumi_tools
+                self._tools = get_tugumi_tools()
+            else:
+                self._tools = []
+        return self._tools
+
+    @property
+    def registered_tools(self) -> list:
+        """Returns currently registered tools list (alias for get_tools)."""
+        return self.get_tools()
+
+    def reload_tools(self) -> list:
+        """Clears cached tools and reloads all static + dynamically synthesized tools."""
+        self._tools = None
+        return self.get_tools()
+
+    def get_subagents(self) -> list:
+        """Returns the list of subagents, lazily loading them on demand."""
+        if self._subagents is None:
+            self._subagents = get_tugumi_subagents() if self.available else []
+        return self._subagents
+
+    def reload_subagents(self) -> list:
+        """Clears cached subagents and reloads them."""
+        self._subagents = None
+        return self.get_subagents()
+
+    def get_mcp_server_names(self) -> List[str]:
+        """Returns the names of all configured MCP 2.0 servers."""
+        try:
+            servers = self._resolve_dynamic_mcp_servers()
+            return [getattr(s, "name", str(s)) for s in servers]
+        except Exception:
+            return []
+
+    def get_telemetry(self) -> Dict[str, Any]:
+        """Returns live Hooks v2 telemetry counters."""
+        return dict(_SDK_TELEMETRY)
+
+    def build_config(
+        self,
+        system_instruction: Optional[str] = None,
+        allow_all_tools: bool = True,
+        extra_tools: Optional[List[Callable]] = None,
+        thinking_level: Optional[str] = None,
+        prompt: str = "",
+        mode: str = "light"
+    ) -> Any:
+        """Builds official LocalAgentConfig for Antigravity Agent with registered tools and subagents.
+        Dynamic Tool Selection: 表も裏もプロンプト意図に応じてツールを動的選定。
+        """
+        if not self.available:
+            raise RuntimeError("google-antigravity SDK is not installed or available.")
+
+        active_level = (thinking_level or self.thinking_level).lower()
+        endpoint_opts = None
+        if GeminiModelOptions:
+            try:
+                endpoint_opts = GeminiModelOptions(thinking_level=active_level)
+            except Exception:
+                pass
+
+        models = [
+            ModelTarget(
+                name=self.model,
+                types=[ModelType.TEXT],
+                endpoint=GeminiAPIEndpoint(api_key=self.api_key, options=endpoint_opts) if self.api_key else None
+            )
+        ]
+
+        # Register custom tools + any extras
+        active_tools = list(self.get_tools())
+        if extra_tools:
+            active_tools.extend(extra_tools)
+
+        # Subagents configuration
+        subagents = list(self.get_subagents())
+        allowed_names = [sub.name for sub in subagents]
+
+        truncation_cfg = ToolOutputTruncationConfig(max_tokens=16000) if ToolOutputTruncationConfig else None
+
+        capabilities = CapabilitiesConfig(
+            enable_subagents=True,
+            allowed_subagents=allowed_names,
+            max_subagent_depth=2,
+            tool_output_truncation_config=truncation_cfg
+        )
+
+        policies = [policy.allow_all()] if (allow_all_tools and policy) else None
+        active_hooks = [
+            h for h in (
+                _tugumi_on_tool_error_hook,
+                _tugumi_post_tool_call_hook,
+                _tugumi_on_compaction_hook,
+            )
+            if h is not None
+        ] or None
+
+        compaction_cfg = CompactionConfig(token_threshold=150000) if CompactionConfig else None
+        retry_cfg = (
+            RetryConfig(
+                api_retry=ModelAPIRetryConfig(
+                    max_retries=1,
+                    initial_sleep_duration_ms=1000,
+                    exponential_multiplier=2.0,
+                    jitter_range=0.2,
+                ),
+                model_output_retry=ModelOutputRetryConfig(max_retries=1),
+            )
+            if (RetryConfig and ModelAPIRetryConfig and ModelOutputRetryConfig)
+            else None
+        )
+
+        save_dir = "/data/data/com.termux/files/home/.tugumi/sessions"
+        os.makedirs(save_dir, exist_ok=True)
+
+        skills_dir = "/data/data/com.termux/files/home/.agents/skills"
+        skills_paths = [skills_dir] if os.path.exists(skills_dir) else []
+
+        # スマート・オンデマンド MCP ネイティブマウント (トークン爆発防止)
+        mcp_servers = self._resolve_dynamic_mcp_servers(prompt=prompt)
+
+        effective_si = system_instruction or self.system_instruction
+
+        return LocalAgentConfig(
+            system_instructions=effective_si,
+            models=models,
+            tools=active_tools,
+            subagents=subagents,
+            capabilities=capabilities,
+            policies=policies,
+            hooks=active_hooks,
+            skills_paths=skills_paths,
+            mcp_servers=mcp_servers,
+            compaction_config=compaction_cfg,
+            retry_config=retry_cfg,
+            save_dir=save_dir,
+            workspaces=[self.workspace]
+        )
+
+    def _resolve_dynamic_mcp_servers(self, prompt: str = "") -> list:
+        """Resolves and mounts all available MCP servers without keyword restrictions (Switch 2 Zero-Compromise).
+        Supports both MCP 2.0 McpStreamableHttpServer and McpStdioServer.
+        """
+        servers = []
+
+        # 1. Base Safe MCP (failure_guard)
+        fg_path = "/data/data/com.termux/files/home/.mcp/failure_guard_mcp.py"
+        if os.path.exists(fg_path):
+            servers.append(McpStdioServer(
+                name="failure_guard",
+                command="python3",
+                args=[fg_path]
+            ))
+
+        # 2. GitHub MCP
+        gh_bin = "/data/data/com.termux/files/home/.mcp/github-mcp-server"
+        if os.path.exists(gh_bin):
+            servers.append(McpStdioServer(
+                name="github",
+                command=gh_bin,
+                args=["stdio"],
+                env={"GITHUB_PERSONAL_ACCESS_TOKEN": os.environ.get("GITHUB_PERSONAL_ACCESS_TOKEN", "")}
+            ))
+
+        # 3. Horse Racing MCP
+        hr_path = "/data/data/com.termux/files/home/horse-racing-mcp/server.py"
+        if os.path.exists(hr_path):
+            servers.append(McpStdioServer(
+                name="horse_racing",
+                command="python3",
+                args=[hr_path]
+            ))
+
+        # 4. Playwright MCP
+        pw_path = "/data/data/com.termux/files/home/.mcp/playwright_mcp_server.mjs"
+        if os.path.exists(pw_path):
+            servers.append(McpStdioServer(
+                name="playwright",
+                command="node",
+                args=[pw_path]
+            ))
+
+        # 5. Twitter / X MCP
+        tw_path = "/data/data/com.termux/files/home/.mcp/twitter_mcp.py"
+        if os.path.exists(tw_path):
+            servers.append(McpStdioServer(
+                name="twitter",
+                command="python3",
+                args=[tw_path]
+            ))
+
+        # 6. Research MCP
+        res_path = "/data/data/com.termux/files/home/.mcp/research_mcp.py"
+        if os.path.exists(res_path):
+            servers.append(McpStdioServer(
+                name="research",
+                command="python3",
+                args=[res_path]
+            ))
+
+        # 7. OSINT Strike MCP
+        osint_path = "/data/data/com.termux/files/home/.mcp/osint_mcp.py"
+        if os.path.exists(osint_path):
+            servers.append(McpStdioServer(
+                name="osint",
+                command="python3",
+                args=[osint_path]
+            ))
+
+        # 8. Reverse Shell Autopilot MCP
+        rev_path = "/data/data/com.termux/files/home/.mcp/revshell_mcp.py"
+        if os.path.exists(rev_path):
+            servers.append(McpStdioServer(
+                name="revshell",
+                command="python3",
+                args=[rev_path]
+            ))
+
+        # 9. Robin Dark Web OSINT MCP
+        robin_py = "/data/data/com.termux/files/home/robin_venv/bin/python3"
+        robin_srv = "/data/data/com.termux/files/home/robin/mcp_server.py"
+        if os.path.exists(robin_py) and os.path.exists(robin_srv):
+            api_k = _resolve_gemini_api_key(self.api_key)
+            servers.append(McpStdioServer(
+                name="robin",
+                command=robin_py,
+                args=[robin_srv],
+                env={
+                    "DISABLE_OLLAMA": "true",
+                    "GEMINI_API_KEY": api_k,
+                    "GOOGLE_API_KEY": api_k,
+                    "ROBIN_MODEL": "gemini-3.8-flash"
+                }
+            ))
+
+        # 10. MCP 2.0 Streamable HTTP Server (gemini-api-docs-mcp)
+        if McpStreamableHttpServer:
+            servers.append(McpStreamableHttpServer(
+                name="gemini-api-docs-mcp",
+                url="https://gemini-api-docs-mcp.dev",
+                headers={
+                    "Mcp-Protocol-Version": "2026-07-28",
+                    "User-Agent": "TUGUMIv6-MCP2/6.2.0 (Android-Termux)"
+                }
+            ))
+
+        # 11. TUGUMI v6 Native MCP Server
+        tugumi_path = "/data/data/com.termux/files/home/.mcp/tugumi_v6_mcp.py"
+        if os.path.exists(tugumi_path):
+            servers.append(McpStdioServer(
+                name="tugumi_v6",
+                command="python3",
+                args=[tugumi_path]
+            ))
+
+        # 12. Metasploit Framework MCP
+        msf_path = "/data/data/com.termux/files/home/metasploitmcp/start_msf_mcp.sh"
+        if os.path.exists(msf_path):
+            servers.append(McpStdioServer(
+                name="metasploit",
+                command="bash",
+                args=[msf_path],
+                env={
+                    "MSF_HOST": "127.0.0.1",
+                    "MSF_PORT": "55553",
+                    "MSF_PASSWORD": os.environ.get("MSF_PASSWORD", "tugumi_genius"),
+                    "MSF_SSL": "false"
+                }
+            ))
+
+        return servers
+
+    def spawn_agent(self, system_instruction: Optional[str] = None, thinking_level: Optional[str] = None):
+        """Creates and returns an Agent instance configured with skills and tools for persistent sessions."""
+        if not self.available:
+            raise RuntimeError("google-antigravity SDK is not installed or available.")
+        config = self.build_config(
+            system_instruction=system_instruction,
+            thinking_level=thinking_level
+        )
+        return Agent(config)
+
+    async def chat_stream_agent(
+        self,
+        agent: Any,
+        prompt: str
+    ) -> AsyncIterator[Tuple[str, Any]]:
+        """Sends prompt to a persistent Agent instance and yields semantic chunks (thought, text, tool_call, tool_result)."""
+        try:
+            resp = await agent.chat(prompt)
+            async for chunk in resp.chunks:
+                if isinstance(chunk, agy_types.Thought):
+                    yield ("thought", chunk.text)
+                elif isinstance(chunk, agy_types.Text):
+                    yield ("text", chunk.text)
+                elif isinstance(chunk, agy_types.ToolCall):
+                    yield ("tool_call", chunk)
+                elif isinstance(chunk, agy_types.ToolResult):
+                    yield ("tool_result", chunk)
+        except Exception as e:
+            yield ("error", str(e))
+
+    async def execute_task_stream(
+        self,
+        prompt: str,
+        system_instruction: Optional[str] = None,
+        thinking_level: Optional[str] = None,
+        mode: str = "light"
+    ) -> AsyncIterator[Tuple[str, Any]]:
+        """
+        Runs an autonomous turn and yields semantic events:
+        - ("thought", text_delta)
+        - ("text", text_delta)
+        - ("tool_call", tool_call_obj)
+        """
+        if not self.available:
+            yield ("error", "google-antigravity SDK not available")
+            return
+
+        config = self.build_config(
+            system_instruction=system_instruction,
+            thinking_level=thinking_level,
+            prompt=prompt,
+            mode=mode
+        )
+        try:
+            async with Agent(config) as agent:
+                resp = await agent.chat(prompt)
+                async for chunk in resp.chunks:
+                    if isinstance(chunk, agy_types.Thought):
+                        yield ("thought", chunk.text)
+                    elif isinstance(chunk, agy_types.Text):
+                        yield ("text", chunk.text)
+                    elif isinstance(chunk, agy_types.ToolCall):
+                        yield ("tool_call", chunk)
+                    elif isinstance(chunk, agy_types.ToolResult):
+                        yield ("tool_result", chunk)
+        except Exception as e:
+            yield ("error", str(e))
+
+    def generate_content_stream_sync(
+        self,
+        prompt: str,
+        system_instruction: Optional[str] = None,
+        thinking_level: Optional[str] = None,
+        mode: str = "light"
+    ) -> Iterator[Tuple[str, Any]]:
+        """
+        Synchronous bridge to execute_task_stream for CLI and WebUI streaming.
+        Uses an isolated background worker thread to prevent asyncio event loop
+        conflicts when invoked inside FastAPI/Uvicorn environments.
+        """
+        import queue
+        import threading
+
+        active_level = thinking_level or self.thinking_level
+        sync_q: queue.Queue = queue.Queue(maxsize=100)
+        stop_event = threading.Event()
+
+        def _worker():
+            worker_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(worker_loop)
+
+            async def _run():
+                try:
+                    async for item in self.execute_task_stream(prompt, system_instruction, thinking_level=active_level, mode=mode):
+                        if stop_event.is_set():
+                            break
+                        sync_q.put(item)
+                except Exception as ex:
+                    sync_q.put(("error", str(ex)))
+                finally:
+                    sync_q.put(None)
+
+            try:
+                worker_loop.run_until_complete(_run())
+            finally:
+                try:
+                    pending = asyncio.all_tasks(worker_loop)
+                    for t in pending:
+                        t.cancel()
+                    if pending:
+                        worker_loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                except Exception:
+                    pass
+                worker_loop.close()
+
+        worker_thread = threading.Thread(target=_worker, daemon=True)
+        worker_thread.start()
+
+        try:
+            while True:
+                item = sync_q.get()
+                if item is None:
+                    break
+                yield item
+        finally:
+            stop_event.set()
+
+    async def execute_task_async(
+        self,
+        prompt: str,
+        system_instruction: Optional[str] = None,
+        thinking_level: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Runs an autonomous agent turn and drains all responses to completion"""
+        if not self.available:
+            return {"status": "error", "error": "google-antigravity SDK not available"}
+
+        config = self.build_config(system_instruction=system_instruction, thinking_level=thinking_level)
+        try:
+            async with Agent(config) as agent:
+                resp = await agent.chat(prompt)
+                content = await resp.text()
+
+                thoughts = []
+                try:
+                    async for t in resp.thoughts:
+                        thoughts.append(t)
+                except Exception:
+                    pass
+
+                return {
+                    "status": "success",
+                    "text": content,
+                    "thoughts": thoughts
+                }
+        except Exception as e:
+            return {
+                "status": "error",
+                "error": str(e)
+            }
+
+    def execute_task(
+        self,
+        prompt: str,
+        system_instruction: Optional[str] = None,
+        thinking_level: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Synchronous wrapper for execute_task_async (event-loop safe)"""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop and loop.is_running():
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(lambda: asyncio.run(self.execute_task_async(prompt, system_instruction=system_instruction, thinking_level=thinking_level)))
+                return future.result()
+        return asyncio.run(self.execute_task_async(prompt, system_instruction=system_instruction, thinking_level=thinking_level))
+
+    def create_session(
+        self,
+        system_instruction: Optional[str] = None,
+        thinking_level: Optional[str] = None,
+        mode: str = "light"
+    ) -> "AntigravitySession":
+        """Spawns a persistent AntigravitySession for continuous multi-turn dialogue with memory preservation."""
+        return AntigravitySession(
+            engine=self,
+            system_instruction=system_instruction,
+            thinking_level=thinking_level,
+            mode=mode
+        )
+
+    def reset_session(self) -> bool:
+        """Defensive compatibility hook for legacy callers."""
+        return True
+
+
+class AntigravitySession:
+    """Persistent Multi-Turn Session for Antigravity Agent.
+    Maintains a persistent Agent instance across dialogue turns in an isolated background thread.
+    Uses thread-safe asyncio.Queue to prevent blocking or event-loop collisions in Termux.
+    """
+    def __init__(
+        self,
+        engine: AntigravityEngine,
+        system_instruction: Optional[str] = None,
+        thinking_level: Optional[str] = None,
+        mode: str = "light"
+    ):
+        self.engine = engine
+        self.system_instruction = system_instruction
+        self.thinking_level = thinking_level
+        self.mode = mode
+        self.loop = None
+        self.async_in_q = None
+        self.ready_event = threading.Event()
+        self.active = True
+        self.thread = None
+        self.current_agent = None
+        self.current_task = None
+        self.current_out_q = None
+        self.turn_count = 0
+        self.created_at = time.time()
+        self._cancel_requested = threading.Event()
+        self._is_paused = False
+        self._was_cancelled_last_turn = False
+        self._inflight_tool_call = None
+        # ターン生存管理: worker が前ターンを完全に片付けて idle になったかを呼び出しスレッドから待機できるようにする
+        self._turn_idle = threading.Event()
+        self._turn_idle.set()
+        # worker 世代: reset/hard-restart 後に残存した旧 worker（ゾンビ）が新 worker の状態を汚染・二重消費しないようにする
+        self._worker_gen = 0
+        self._cancel_inflight = None
+        self._start_worker()
+
+    def set_paused(self, paused: bool):
+        """Sets or clears pause state so timeout timers freeze while Master Takuma is in TASK PAUSED."""
+        self._is_paused = bool(paused)
+
+    def _start_worker(self):
+        self.active = True
+        self._worker_gen += 1
+        self._turn_idle.set()
+        self.ready_event.clear()
+        self.thread = threading.Thread(target=self._run_loop, args=(self._worker_gen,), daemon=True)
+        self.thread.start()
+        self.ready_event.wait(timeout=60.0)
+
+    async def _bounded_cancel(self, conv: Any, timeout: float = 3.0) -> None:
+        """conversation.cancel() を「重複排除 + タイムアウト付き」で実行する。
+
+        再開時のハング原因: キャンセル待機が無期限・多重(cancel() / CancelledError処理 / 次ターン準備が同時に
+        conv.cancel() を呼ぶ)だと worker がキャンセル完了待ちで固まり、後続の追加プロンプトが処理されない。
+        """
+        inflight = self._cancel_inflight
+        if inflight is not None and not inflight.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(inflight), timeout=timeout)
+            except (asyncio.TimeoutError, Exception):
+                pass
+            return
+        task = asyncio.ensure_future(conv.cancel())
+        self._cancel_inflight = task
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
+        except asyncio.TimeoutError:
+            task.cancel()
+        except Exception:
+            pass
+
+    async def _close_dangling_tool_call(self, agent: Any, timeout: float = 2.0) -> bool:
+        """未完了の function_call があれば {"status": "interrupted_by_user"} のダミー応答でペアを閉じ、
+        次のユーザー発言が function_call 直後に割り込むスキーマ違反（API/ハーネスの沈黙停止）を防ぐ"""
+        tc = self._inflight_tool_call
+        if tc is None or not getattr(tc, "id", None):
+            return False
+        self._inflight_tool_call = None
+        try:
+            conn = getattr(agent.conversation, "_connection", None)
+            proc = getattr(conn, "_processor", None) if conn else None
+            if proc is None:
+                return False
+            await asyncio.wait_for(
+                proc._send_tool_results([
+                    agy_types.ToolResult(
+                        id=tc.id,
+                        name=getattr(tc, "name", "tool"),
+                        result={"status": "interrupted_by_user", "message": "Interrupted by Master Takuma via ESC"},
+                    )
+                ]),
+                timeout=timeout,
+            )
+            return True
+        except Exception:
+            return False
+
+    def _flush_stale_requests(self) -> None:
+        """worker 側 async_in_q に残留した中断前の古い要求を破棄（死んだ出力キュー宛てに推論を実行して課金・競合するのを防ぐ）"""
+        loop, q = self.loop, self.async_in_q
+        if loop is None or q is None or not loop.is_running():
+            return
+
+        async def _drain():
+            n = 0
+            while not q.empty():
+                try:
+                    q.get_nowait()
+                    n += 1
+                except Exception:
+                    break
+            return n
+
+        try:
+            asyncio.run_coroutine_threadsafe(_drain(), loop).result(timeout=1.0)
+        except Exception:
+            pass
+
+    def _quiesce_previous_turn(self, timeout: float = 5.0) -> None:
+        """新ターン投入前に、前ターンの worker タスクが完全に片付く(idle)まで保証する。
+
+        再開（追加プロンプト投入）時のハング原因: 中断した旧ターンの _execute がキャンセル後処理中のまま
+        新要求を積むと、旧ターンの _cancel_requested.clear() 競合・旧タスク残響・キュー滞留で新ターンが詰まる。
+        """
+        if self._turn_idle.wait(timeout=0.25):
+            self._flush_stale_requests()
+            return
+        self.cancel()
+        if not self._turn_idle.wait(timeout=timeout):
+            # 旧ターンが規定時間内に片付かない → worker を世代ごと完全破棄して新規再生成（永久ハング遮断）
+            print("[AntigravitySession] 前ターンの終了待機がタイムアウト。worker を完全再生成して再開します。")
+            self.reset()
+            return
+        self._flush_stale_requests()
+
+    def _run_loop(self, gen: int = 0):
+        # ローカル束縛: 世代交代後に self.loop が新 worker のループへ差し替わっても、旧 worker が新ループを close しない
+        my_loop = asyncio.new_event_loop()
+        self.loop = my_loop
+        asyncio.set_event_loop(my_loop)
+
+        def _is_ws_closed_error(err: BaseException) -> bool:
+            msg = str(err)
+            cls_name = type(err).__name__
+            return (
+                "ConnectionClosed" in cls_name
+                or "received 1000" in msg
+                or "then sent 1000" in msg
+                or "sent 1000" in msg
+                or "received 1001" in msg
+                or "Harness process exited" in msg
+                or ("WebSocket" in msg and "closed" in msg.lower())
+                or "cannot call recv" in msg.lower()
+                or "connection is closed" in msg.lower()
+            )
+
+        async def _prepare_agent_for_turn(agent: Any) -> bool:
+            """
+            Ensures the underlying Conversation & LocalConnection are 100% idle and free of
+            stale 'Turn cancelled' exceptions in < 0.1s without restarting the Agent or MCP servers.
+            """
+            try:
+                conv = agent.conversation
+                conn = getattr(conv, "_connection", None)
+                proc = getattr(conn, "_processor", None) if conn else None
+                if conn is None or proc is None:
+                    return True
+
+                # 1. 前のターンがキャンセルされた直後、またはまだ is_idle でない場合のみクリーンアップ
+                if not conn.is_idle or self._was_cancelled_last_turn:
+                    if not conn.is_idle:
+                        try:
+                            from interfaces.cli.task_interrupter import TaskInterrupter
+                            TaskInterrupter.terminate_all_active_processes()
+                        except Exception:
+                            pass
+                        try:
+                            await self._bounded_cancel(conv)
+                        except Exception:
+                            pass
+
+                        # まず0.15秒待つ（非ブロッキング化されたrun_termux_commandなら0.03秒で完了してis_idleになる）
+                        try:
+                            await asyncio.wait_for(proc.is_idle.wait(), timeout=0.15)
+                        except asyncio.TimeoutError:
+                            # もし他のツール呼び出しがまだ応答していない場合、インフライトのtool_callに即座にキャンセル応答を送ってlocalharnessを0.01秒で解放する
+                            await self._close_dangling_tool_call(agent)
+                            try:
+                                await asyncio.wait_for(proc.is_idle.wait(), timeout=0.6)
+                            except asyncio.TimeoutError:
+                                # それでも戻らない場合でもセッション再起動(25秒)は避け、強制的にidle状態へリセットして即座に次ターンへ進める
+                                proc.is_idle.set()
+
+                    # 2. step_queue に残留している前ターンの AntigravityExecutionError('Turn cancelled') 等を完全ドレイン
+                    self._inflight_tool_call = None
+                    conn._client_cancelled = False
+                    conn._is_receiving = False
+                    while not proc.step_queue.empty():
+                        try:
+                            proc.step_queue.get_nowait()
+                        except Exception:
+                            break
+                return True
+            except Exception:
+                return True
+
+        async def _main():
+            my_in_q = asyncio.Queue()
+            self.async_in_q = my_in_q
+            retry_req = None
+
+            while self.active and gen == self._worker_gen:
+                config = self.engine.build_config(
+                    system_instruction=self.system_instruction,
+                    thinking_level=self.thinking_level,
+                    mode=self.mode
+                )
+                try:
+                    async with Agent(config) as agent:
+                        self.current_agent = agent
+                        self._cancel_inflight = None
+                        self.ready_event.set()
+                        reconnect_needed = False
+
+                        while self.active and gen == self._worker_gen and not reconnect_needed:
+                            if retry_req is not None:
+                                req = retry_req
+                                retry_req = None
+                            else:
+                                req = await my_in_q.get()
+
+                            if gen != self._worker_gen:
+                                break  # 世代交代済みの旧 worker（ゾンビ）は新 worker のために一切処理せず退場
+                            if req is None or not self.active:
+                                self.active = False
+                                break
+
+                            if len(req) == 3:
+                                prompt, out_sync_q, is_retry = req
+                            else:
+                                prompt, out_sync_q = req
+                                is_retry = False
+
+                            self.current_out_q = out_sync_q
+                            _SDK_TELEMETRY["_active_out_q"] = out_sync_q
+                            if not is_retry:
+                                self.turn_count += 1
+                            self._cancel_requested.clear()
+
+                            async def _execute(prompt=prompt, out_sync_q=out_sync_q, is_retry=is_retry):
+                                nonlocal reconnect_needed, retry_req
+                                waiting_tool_execution = False
+                                last_tool_call_name = ""
+                                emitted_any = False
+                                ended_empty = False
+                                try:
+                                    # 前ターンのキャンセル残留状態・デッドロックを事前解消
+                                    is_ready = await _prepare_agent_for_turn(agent)
+                                    if not is_ready:
+                                        reconnect_needed = True
+                                        retry_req = (prompt, out_sync_q, True)
+                                        return
+
+                                    self._was_cancelled_last_turn = False
+                                    _SDK_TELEMETRY["_tool_completed"] = False
+                                    # 初回レスポンス到達タイムアウト（120秒）で永久ハングを物理遮断
+                                    resp = await asyncio.wait_for(agent.chat(prompt), timeout=120.0)
+                                    chunk_iter = resp.chunks.__aiter__()
+                                    idle_elapsed = 0.0
+                                    next_chunk_task = None
+                                    try:
+                                        while True:
+                                            if self._cancel_requested.is_set():
+                                                if next_chunk_task and not next_chunk_task.done():
+                                                    next_chunk_task.cancel()
+                                                try:
+                                                    await self._bounded_cancel(agent.conversation)
+                                                except Exception:
+                                                    pass
+                                                out_sync_q.put(("cancelled", "Task cancelled"))
+                                                break
+
+                                            if next_chunk_task is None:
+                                                next_chunk_task = asyncio.ensure_future(chunk_iter.__anext__())
+
+                                            done, _ = await asyncio.wait({next_chunk_task}, timeout=2.0)
+                                            if not done:
+                                                if self._cancel_requested.is_set():
+                                                    next_chunk_task.cancel()
+                                                    try:
+                                                        await self._bounded_cancel(agent.conversation)
+                                                    except Exception:
+                                                        pass
+                                                    out_sync_q.put(("cancelled", "Task cancelled"))
+                                                    break
+                                                if _SDK_TELEMETRY.get("_tool_completed"):
+                                                    waiting_tool_execution = False
+                                                    self._inflight_tool_call = None
+                                                    _SDK_TELEMETRY["_tool_completed"] = False
+                                                # ESC一時停止中（TASK PAUSED）はタイマーを加算せず待機継続
+                                                if self._is_paused:
+                                                    continue
+                                                idle_elapsed += 2.0
+                                                max_wait = 360.0 if waiting_tool_execution else 180.0
+                                                if idle_elapsed < max_wait:
+                                                    continue
+                                                next_chunk_task.cancel()
+                                                try:
+                                                    await self._bounded_cancel(agent.conversation)
+                                                except Exception:
+                                                    pass
+                                                err_msg = (
+                                                    f"ツール実行タイムアウト (360秒待機超過: 直前ツール '{last_tool_call_name or '不明'}') - プロセスのハングまたは長期実行を安全遮断しました"
+                                                    if waiting_tool_execution
+                                                    else "ストリーミングチャンク受信タイムアウト (180秒無通信検知)"
+                                                )
+                                                out_sync_q.put(("error", err_msg))
+                                                break
+
+                                            try:
+                                                chunk = next_chunk_task.result()
+                                            except StopAsyncIteration:
+                                                ended_empty = not emitted_any
+                                                break
+                                            finally:
+                                                next_chunk_task = None
+                                            idle_elapsed = 0.0
+
+                                            if self._cancel_requested.is_set():
+                                                try:
+                                                    await self._bounded_cancel(agent.conversation)
+                                                except Exception:
+                                                    pass
+                                                out_sync_q.put(("cancelled", "Task cancelled"))
+                                                break
+                                            if isinstance(chunk, agy_types.Thought):
+                                                emitted_any = True
+                                                waiting_tool_execution = False
+                                                self._inflight_tool_call = None
+                                                out_sync_q.put(("thought", chunk.text))
+                                            elif isinstance(chunk, agy_types.Text):
+                                                emitted_any = True
+                                                waiting_tool_execution = False
+                                                self._inflight_tool_call = None
+                                                out_sync_q.put(("text", chunk.text))
+                                            elif isinstance(chunk, agy_types.ToolCall):
+                                                emitted_any = True
+                                                waiting_tool_execution = True
+                                                self._inflight_tool_call = chunk
+                                                last_tool_call_name = getattr(chunk, "name", "tool")
+                                                out_sync_q.put(("tool_call", chunk))
+                                            elif isinstance(chunk, agy_types.ToolResult):
+                                                emitted_any = True
+                                                waiting_tool_execution = False
+                                                self._inflight_tool_call = None
+                                                out_sync_q.put(("tool_result", chunk))
+                                    finally:
+                                        if next_chunk_task and not next_chunk_task.done():
+                                            next_chunk_task.cancel()
+
+                                    # 前ターンのキャンセル残響でストリームが1チャンクも出さずに正常終了した場合
+                                    # (例: MCPロード中のcontext canceled) は、新規Agentへ透過再接続して1回だけ自動再試行
+                                    if ended_empty and not is_retry and not self._cancel_requested.is_set():
+                                        reconnect_needed = True
+                                        retry_req = (prompt, out_sync_q, True)
+                                        return
+                                except asyncio.TimeoutError:
+                                    try:
+                                        await self._bounded_cancel(agent.conversation)
+                                    except Exception:
+                                        pass
+                                    out_sync_q.put(("error", "API接続・初回レスポンス待機タイムアウト (120秒無応答ハング検知)"))
+                                except asyncio.CancelledError:
+                                    try:
+                                        await self._bounded_cancel(agent.conversation)
+                                    except Exception:
+                                        pass
+                                    out_sync_q.put(("cancelled", "Task cancelled"))
+                                except Exception as e:
+                                    err_str = str(e)
+                                    if _is_ws_closed_error(e) or ("Turn cancelled" in err_str and not emitted_any and not is_retry):
+                                        reconnect_needed = True
+                                        if not emitted_any and not is_retry and not self._cancel_requested.is_set():
+                                            # 1チャンクも送出する前にWebSocket切断または前ターンのTurn cancelled残響を検知した場合、新規Agentへ透過再接続して自動再試行
+                                            retry_req = (prompt, out_sync_q, True)
+                                            return
+                                    out_sync_q.put(("error", err_str))
+                                finally:
+                                    if retry_req is None:
+                                        if _SDK_TELEMETRY.get("_active_out_q") is out_sync_q:
+                                            _SDK_TELEMETRY["_active_out_q"] = None
+                                        # done を通知する前に idle を確定: 消費側が done を受け取って即次ターンを投入しても競合しない
+                                        self._turn_idle.set()
+                                        out_sync_q.put(("done", None))
+
+                            self.current_task = asyncio.create_task(_execute())
+                            try:
+                                await self.current_task
+                            except (asyncio.CancelledError, Exception):
+                                pass
+                            finally:
+                                self.current_task = None
+                                # 新ターンが既に current_out_q を差し替えている場合は絶対に上書きしない（所有者のみ解放）
+                                if retry_req is None and self.current_out_q is out_sync_q:
+                                    self.current_out_q = None
+                except asyncio.CancelledError:
+                    self.ready_event.set()
+                    break
+                except Exception as e:
+                    self.ready_event.set()
+                    if retry_req is not None:
+                        _, failed_q, _ = retry_req
+                        retry_req = None
+                        try:
+                            failed_q.put(("error", f"Antigravity再接続エラー: {e}"))
+                            failed_q.put(("done", None))
+                        except Exception:
+                            pass
+                    print(f"[AntigravitySession] Worker error: {e}")
+                    if not self.active:
+                        break
+                    await asyncio.sleep(0.2)
+                finally:
+                    if gen == self._worker_gen:
+                        self.current_agent = None
+
+        try:
+            my_loop.run_until_complete(_main())
+        except (Exception, asyncio.CancelledError):
+            pass
+        finally:
+            if gen == self._worker_gen:
+                self._turn_idle.set()  # worker 終了時は idle 扱い（次ターンが無駄な待機をせず再生成へ進める）
+            try:
+                # 未完了タスクの全キャンセルと完了待機
+                pending = [t for t in asyncio.all_tasks(my_loop) if not t.done()]
+                for t in pending:
+                    t.cancel()
+                if pending:
+                    my_loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                # 非同期ジェネレータのシャットダウン
+                my_loop.run_until_complete(my_loop.shutdown_asyncgens())
+                if hasattr(my_loop, "shutdown_default_executor"):
+                    my_loop.run_until_complete(my_loop.shutdown_default_executor())
+            except (Exception, asyncio.CancelledError):
+                pass
+            finally:
+                try:
+                    if my_loop and not my_loop.is_closed() and not my_loop.is_running():
+                        my_loop.close()
+                except (Exception, asyncio.CancelledError):
+                    pass
+
+    def cancel(self):
+        """Cancels the currently running agent turn safely and unblocks receivers and child processes."""
+        self._cancel_requested.set()
+        self._is_paused = False
+        self._was_cancelled_last_turn = True
+        try:
+            from interfaces.cli.task_interrupter import TaskInterrupter
+            TaskInterrupter.terminate_all_active_processes()
+        except Exception:
+            pass
+        if self.loop and self.loop.is_running():
+            if self.current_agent:
+                try:
+                    async def _do_cancel():
+                        try:
+                            await self._bounded_cancel(self.current_agent.conversation)
+                        except Exception:
+                            pass
+                    asyncio.run_coroutine_threadsafe(_do_cancel(), self.loop)
+                except Exception:
+                    pass
+            target_task = self.current_task
+            if target_task and not target_task.done():
+                try:
+                    # 呼び出し時点のタスクを束縛: 遅延実行されても再開後の新ターンを巻き込まない
+                    self.loop.call_soon_threadsafe(target_task.cancel)
+                except Exception:
+                    pass
+        if self.current_out_q:
+            try:
+                # キューに残った古いチャンクを全て破棄して混入防止
+                while not self.current_out_q.empty():
+                    try:
+                        self.current_out_q.get_nowait()
+                    except Exception:
+                        break
+                self.current_out_q.put_nowait(("cancelled", "Task cancelled"))
+                self.current_out_q.put_nowait(("done", None))
+            except Exception:
+                pass
+
+    def chat_stream(self, prompt: str) -> Iterator[Tuple[str, Any]]:
+        """Sends prompt to persistent Agent and yields streaming semantic events."""
+        if not self.active or self.loop is None or self.async_in_q is None or not self.thread or not self.thread.is_alive():
+            self._start_worker()
+
+        # 再開時ハング対策: 前ターン(中断済み)を worker が完全に片付けるまで待ち、残留要求を破棄してから新ターンを投入
+        self._quiesce_previous_turn()
+        if not self.active or self.loop is None or self.async_in_q is None or not self.thread or not self.thread.is_alive():
+            self._start_worker()
+        self._cancel_requested.clear()
+        self._is_paused = False
+        self._turn_idle.clear()
+        out_sync_q = queue.Queue()
+        self.current_out_q = out_sync_q
+        self.loop.call_soon_threadsafe(self.async_in_q.put_nowait, (prompt, out_sync_q))
+        start_stream_time = time.time()
+        last_chunk_time = start_stream_time
+        paused_accumulated = 0.0
+        last_tick_time = start_stream_time
+        try:
+            while True:
+                if self._cancel_requested.is_set():
+                    yield ("cancelled", "Task cancelled")
+                    break
+                try:
+                    chunk_type, data = out_sync_q.get(timeout=0.1)
+                except queue.Empty:
+                    if not self.active or not self.thread or not self.thread.is_alive():
+                        yield ("error", "Antigravity background worker died unexpectedly")
+                        break
+                    now = time.time()
+                    dt = max(0.0, now - last_tick_time)
+                    last_tick_time = now
+                    if self._is_paused:
+                        # 一時停止中はタイムアウトタイマーを凍結
+                        last_chunk_time = now
+                        paused_accumulated += dt
+                        continue
+                    # 定期パルス（tick）を上位に返し、タイマー更新およびESCキー捕捉をリアルタイム化
+                    if now - last_chunk_time > 400.0:
+                        yield ("error", "Antigravity推論全体タイムアウト (400秒無応答検知・自動保護)")
+                        break
+                    yield ("tick", max(0.0, (now - start_stream_time) - paused_accumulated))
+                    continue
+
+                last_chunk_time = time.time()
+                last_tick_time = last_chunk_time
+                if chunk_type == "done":
+                    break
+                elif chunk_type == "cancelled":
+                    break
+                yield (chunk_type, data)
+        except GeneratorExit:
+            # Half-Open ストリーム対策: 既に新ターンへ再バインド済みなら、旧ストリームの close が新ターンを cancel してはならない
+            if self.current_out_q is out_sync_q:
+                self.cancel()
+            raise
+        except Exception as e:
+            if self.current_out_q is out_sync_q:
+                self.cancel()
+            raise e
+        finally:
+            if self.current_out_q is out_sync_q:
+                self.current_out_q = None
+
+    def close(self):
+        """Closes the persistent session cleanly."""
+        self.active = False
+        self.cancel()
+        if self.loop and self.async_in_q and self.loop.is_running():
+            try:
+                self.loop.call_soon_threadsafe(self.async_in_q.put_nowait, None)
+            except Exception:
+                pass
+        if self.thread and self.thread.is_alive():
+            self.thread.join(timeout=2.0)
+
+    def reset(self, system_instruction: Optional[str] = None):
+        """Resets the persistent session and creates a fresh Agent context."""
+        self.close()
+        self.turn_count = 0
+        self.created_at = time.time()
+        time.sleep(0.1)
+        if system_instruction:
+            self.system_instruction = system_instruction
+        self._start_worker()
